@@ -1,0 +1,716 @@
+const { useMemo, useRef, useState } = React;
+const { toPng } = htmlToImage;
+
+/**
+ * Simple Web‑Comic Builder
+ * - Choose layout (1,2,3,4 panels)
+ * - Set panel background color or upload an image per panel
+ * - Add draggable/resizable elements: Speech, Caption, SFX text, or Image
+ * - Edit properties (text, font size, colors, rotation, z‑order)
+ * - Export full page as PNG, or save/load JSON
+ *
+ * Notes:
+ * - Uses TailwindCSS for styling (no import needed)
+ * - No external backend; everything is in-memory
+ */
+
+// --------- Utilities ---------
+const uid = () => Math.random().toString(36).slice(2) + Date.now().toString(36);
+
+const clamp = (v, min, max) => Math.min(max, Math.max(min, v));
+
+function download(dataUrl, filename) {
+  const a = document.createElement("a");
+  a.href = dataUrl;
+  a.download = filename;
+  a.click();
+}
+
+function downloadJSON(obj, filename) {
+  const blob = new Blob([JSON.stringify(obj, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  download(url, filename);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+// --------- Defaults ---------
+const DEFAULT_PAGE = {
+  id: uid(),
+  title: "Untitled Comic",
+  aspect: "strip", // 'square' | 'widescreen' | 'strip'
+  gutter: 12,
+  border: true,
+  bgColor: "#ffffff",
+  layout: "2x2", // presets: '1x1','1x2','2x1','2x2','3x1','1x4'
+  panels: [],
+};
+
+const makePanelsForLayout = (layout) => {
+  const base = () => ({ id: uid(), bgColor: "#f8fafc", bgImage: null, elements: [] });
+  switch (layout) {
+    case "1x1":
+      return [base()];
+    case "1x2":
+      return [base(), base()];
+    case "2x1":
+      return [base(), base()];
+    case "2x2":
+      return [base(), base(), base(), base()];
+    case "3x1":
+      return [base(), base(), base()];
+    case "1x4":
+      return [base(), base(), base(), base()];
+    default:
+      return [base(), base(), base(), base()];
+  }
+};
+
+const ELEMENT_PRESETS = {
+  speech: () => ({
+    id: uid(),
+    type: "speech",
+    x: 40,
+    y: 40,
+    w: 220,
+    h: 100,
+    rotation: 0,
+    text: "Your dialogue here…",
+    fontSize: 18,
+    color: "#111827",
+    fill: "#ffffff",
+    stroke: "#111827",
+    radius: 16,
+    padding: 10,
+    z: 1,
+  }),
+  caption: () => ({
+    id: uid(),
+    type: "caption",
+    x: 20,
+    y: 20,
+    w: 260,
+    h: 80,
+    rotation: 0,
+    text: "Caption text",
+    fontSize: 16,
+    color: "#111827",
+    fill: "#fff3cd",
+    stroke: "#111827",
+    radius: 8,
+    padding: 8,
+    z: 1,
+  }),
+  sfx: () => ({
+    id: uid(),
+    type: "sfx",
+    x: 60,
+    y: 60,
+    w: 220,
+    h: 80,
+    rotation: 0,
+    text: "KRAKOOM!",
+    fontSize: 36,
+    color: "#dc2626",
+    fill: "#ffffff00",
+    stroke: "#111827",
+    radius: 0,
+    padding: 0,
+    z: 2,
+  }),
+  image: (imgData) => ({
+    id: uid(),
+    type: "image",
+    x: 40,
+    y: 40,
+    w: 240,
+    h: 160,
+    rotation: 0,
+    imageData: imgData || null,
+    z: 0,
+  }),
+};
+
+// --------- Draggable/Resizable Element ---------
+function useDragResize({ onChange, boundsRef }) {
+  const dragging = useRef(null); // { kind: 'move'|'resize', id, startX, startY, startRect }
+
+  const onPointerDown = (e, id, kind, getRect) => {
+    e.stopPropagation();
+    const rect = getRect();
+    dragging.current = {
+      kind,
+      id,
+      startX: e.clientX,
+      startY: e.clientY,
+      startRect: rect,
+    };
+    (e.target).setPointerCapture?.(e.pointerId);
+  };
+
+  const onPointerMove = (e) => {
+    if (!dragging.current) return;
+    const dx = e.clientX - dragging.current.startX;
+    const dy = e.clientY - dragging.current.startY;
+    const { kind, id, startRect } = dragging.current;
+
+    const parent = boundsRef.current;
+    const bbox = parent?.getBoundingClientRect?.();
+    const maxW = bbox ? bbox.width : Infinity;
+    const maxH = bbox ? bbox.height : Infinity;
+
+    if (kind === "move") {
+      const nx = clamp(startRect.x + dx, 0, maxW - startRect.w);
+      const ny = clamp(startRect.y + dy, 0, maxH - startRect.h);
+      onChange(id, { x: nx, y: ny });
+    } else if (kind === "resize") {
+      const nw = clamp(startRect.w + dx, 40, maxW - startRect.x);
+      const nh = clamp(startRect.h + dy, 40, maxH - startRect.y);
+      onChange(id, { w: nw, h: nh });
+    }
+  };
+
+  const onPointerUp = (e) => {
+    if (dragging.current) {
+      (e.target).releasePointerCapture?.(e.pointerId);
+    }
+    dragging.current = null;
+  };
+
+  return { onPointerDown, onPointerMove, onPointerUp };
+}
+
+function ElementView({ el, selected, onSelect, onChange, boundsRef }) {
+  const wrapRef = useRef(null);
+  const { onPointerDown, onPointerMove, onPointerUp } = useDragResize({ onChange, boundsRef });
+
+  const baseStyle = {
+    transform: `translate(${el.x}px, ${el.y}px) rotate(${el.rotation}deg)`,
+    width: el.w,
+    height: el.h,
+    zIndex: el.z ?? 0,
+  };
+
+  const commonBox = (
+    <div
+      className={[
+        "absolute select-none",
+        selected ? "ring-2 ring-sky-500" : "ring-1 ring-slate-300",
+        "shadow-sm",
+        el.type !== "image" ? "bg-white" : "bg-transparent",
+      ].join(" ")}
+      style={baseStyle}
+      onPointerDown={(e) => { onSelect(el.id); onPointerDown(e, el.id, "move", () => ({ x: el.x, y: el.y, w: el.w, h: el.h })); }}
+      onPointerMove={onPointerMove}
+      onPointerUp={onPointerUp}
+      ref={wrapRef}
+    >
+      {/* Content */}
+      {el.type === "image" ? (
+        el.imageData ? (
+          <img src={el.imageData} alt="sticker" className="w-full h-full object-contain" draggable={false} />
+        ) : (
+          <div className="w-full h-full grid place-items-center bg-white/40 border border-dashed border-slate-400 text-slate-500 text-sm">
+            No image
+          </div>
+        )
+      ) : el.type === "sfx" ? (
+        <div className="w-full h-full grid place-items-center">
+          <div
+            className="font-extrabold uppercase tracking-wide text-center drop-shadow"
+            style={{
+              fontSize: el.fontSize,
+              color: el.color,
+              WebkitTextStroke: "1.5px #111827",
+            }}
+          >
+            {el.text}
+          </div>
+        </div>
+      ) : (
+        <div
+          className="w-full h-full"
+          style={{
+            background: el.fill,
+            color: el.color,
+            borderRadius: el.radius,
+            border: `2px solid ${el.stroke}`,
+            padding: el.padding,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            textAlign: "center",
+            fontSize: el.fontSize,
+          }}
+        >
+          {el.text}
+        </div>
+      )}
+
+      {/* Resize handle */}
+      <div
+        className="absolute bottom-0 right-0 translate-x-1/2 translate-y-1/2 w-4 h-4 rounded-full bg-sky-500 border border-white shadow cursor-se-resize"
+        onPointerDown={(e) => onPointerDown(e, el.id, "resize", () => ({ x: el.x, y: el.y, w: el.w, h: el.h }))}
+        onPointerMove={onPointerMove}
+        onPointerUp={onPointerUp}
+      />
+    </div>
+  );
+
+  return commonBox;
+}
+
+// --------- Main App ---------
+function App() {
+  const [page, setPage] = useState(() => {
+    const initial = { ...DEFAULT_PAGE };
+    initial.panels = makePanelsForLayout(initial.layout);
+    return initial;
+  });
+
+  const [activePanel, setActivePanel] = useState(0);
+  const [activeElementId, setActiveElementId] = useState(null);
+  const boardRef = useRef(null);
+  const panelRefs = useRef([]);
+
+  const gridSpec = useMemo(() => {
+    const { layout } = page;
+    switch (layout) {
+      case "1x1":
+        return { cols: 1, rows: 1 };
+      case "1x2":
+        return { cols: 2, rows: 1 };
+      case "2x1":
+        return { cols: 1, rows: 2 };
+      case "2x2":
+        return { cols: 2, rows: 2 };
+      case "3x1":
+        return { cols: 1, rows: 3 };
+      case "1x4":
+        return { cols: 4, rows: 1 };
+      default:
+        return { cols: 2, rows: 2 };
+    }
+  }, [page.layout]);
+
+  const pageSize = useMemo(() => {
+    // Logical pixel size for the board preview
+    switch (page.aspect) {
+      case "square":
+        return { w: 900, h: 900 };
+      case "widescreen":
+        return { w: 1200, h: 675 };
+      case "strip":
+      default:
+        return { w: 1200, h: 450 };
+    }
+  }, [page.aspect]);
+
+  const selectPanel = (idx) => {
+    setActivePanel(idx);
+    setActiveElementId(null);
+  };
+
+  const addElement = async (kind) => {
+    const panels = [...page.panels];
+    const p = { ...panels[activePanel] };
+
+    if (kind === "image") {
+      const dataUrl = await pickImageAsDataURL();
+      if (!dataUrl) return;
+      p.elements = [...p.elements, ELEMENT_PRESETS.image(dataUrl)];
+    } else {
+      p.elements = [...p.elements, ELEMENT_PRESETS[kind]()] ;
+    }
+
+    panels[activePanel] = p;
+    setPage({ ...page, panels });
+  };
+
+  const updateElement = (id, patch) => {
+    const panels = [...page.panels];
+    const p = { ...panels[activePanel] };
+    p.elements = p.elements.map((e) => (e.id === id ? { ...e, ...patch } : e));
+    panels[activePanel] = p;
+    setPage({ ...page, panels });
+  };
+
+  const deleteElement = (id) => {
+    const panels = [...page.panels];
+    const p = { ...panels[activePanel] };
+    p.elements = p.elements.filter((e) => e.id !== id);
+    panels[activePanel] = p;
+    setPage({ ...page, panels });
+    setActiveElementId(null);
+  };
+
+  const nudgeElement = (dx, dy) => {
+    if (!activeElementId) return;
+    const p = page.panels[activePanel];
+    const el = p.elements.find((e) => e.id === activeElementId);
+    if (!el) return;
+    updateElement(activeElementId, { x: clamp(el.x + dx, 0, Infinity), y: clamp(el.y + dy, 0, Infinity) });
+  };
+
+  const changeLayout = (layout) => {
+    const prevPanels = page.panels;
+    const newPanels = makePanelsForLayout(layout);
+    // Try to preserve first few panels' content
+    for (let i = 0; i < Math.min(prevPanels.length, newPanels.length); i++) {
+      newPanels[i] = { ...newPanels[i], ...prevPanels[i] };
+    }
+    setPage({ ...page, layout, panels: newPanels });
+    setActivePanel(0);
+    setActiveElementId(null);
+  };
+
+  const setPanelBgColor = (color) => {
+    const panels = [...page.panels];
+    panels[activePanel] = { ...panels[activePanel], bgColor: color };
+    setPage({ ...page, panels });
+  };
+
+  const setPanelBgImage = async () => {
+    const dataUrl = await pickImageAsDataURL();
+    if (!dataUrl) return;
+    const panels = [...page.panels];
+    panels[activePanel] = { ...panels[activePanel], bgImage: dataUrl };
+    setPage({ ...page, panels });
+  };
+
+  const clearPanelBgImage = () => {
+    const panels = [...page.panels];
+    panels[activePanel] = { ...panels[activePanel], bgImage: null };
+    setPage({ ...page, panels });
+  };
+
+  const bringForward = () => {
+    if (!activeElementId) return;
+    const panels = [...page.panels];
+    const p = { ...panels[activePanel] };
+    const maxZ = Math.max(0, ...p.elements.map((e) => e.z || 0));
+    p.elements = p.elements.map((e) => (e.id === activeElementId ? { ...e, z: (e.z || 0) + 1 } : e));
+    panels[activePanel] = p;
+    setPage({ ...page, panels });
+  };
+
+  const sendBackward = () => {
+    if (!activeElementId) return;
+    const panels = [...page.panels];
+    const p = { ...panels[activePanel] };
+    p.elements = p.elements.map((e) => (e.id === activeElementId ? { ...e, z: Math.max(0, (e.z || 0) - 1) } : e));
+    panels[activePanel] = p;
+    setPage({ ...page, panels });
+  };
+
+  const exportPNG = async () => {
+    if (!boardRef.current) return;
+    const dataUrl = await toPng(boardRef.current, { cacheBust: true, pixelRatio: 2 });
+    download(dataUrl, `${page.title.replace(/\s+/g, "_") || "comic"}.png`);
+  };
+
+  const exportJSON = () => downloadJSON(page, `${page.title.replace(/\s+/g, "_") || "comic"}.json`);
+
+  const importJSON = async () => {
+    const text = await pickJSONText();
+    if (!text) return;
+    try {
+      const obj = JSON.parse(text);
+      if (!obj || !Array.isArray(obj.panels)) throw new Error("Invalid file");
+      const merged = {
+        ...DEFAULT_PAGE,
+        ...obj,
+        id: obj.id || uid(),
+        panels: obj.panels.map((p) => ({
+          id: p.id || uid(),
+          bgColor: p.bgColor ?? "#f8fafc",
+          bgImage: p.bgImage ?? null,
+          elements: Array.isArray(p.elements) ? p.elements : [],
+        })),
+      };
+      setPage(merged);
+      setActivePanel(0);
+      setActiveElementId(null);
+    } catch (e) {
+      alert("Invalid JSON");
+    }
+  };
+
+  // Keyboard nudging for selected element
+  React.useEffect(() => {
+    const onKey = (e) => {
+      if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(e.key)) {
+        e.preventDefault();
+        const d = e.shiftKey ? 10 : 2;
+        if (e.key === "ArrowUp") nudgeElement(0, -d);
+        if (e.key === "ArrowDown") nudgeElement(0, d);
+        if (e.key === "ArrowLeft") nudgeElement(-d, 0);
+        if (e.key === "ArrowRight") nudgeElement(d, 0);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [activeElementId, page, activePanel]);
+
+  const activeEl = page.panels[activePanel]?.elements.find((e) => e.id === activeElementId) || null;
+
+  return (
+    <div className="w-full min-h-screen bg-slate-50 text-slate-800">
+      <header className="sticky top-0 z-10 backdrop-blur bg-white/70 border-b border-slate-200">
+        <div className="max-w-6xl mx-auto px-4 py-3 flex items-center gap-3">
+          <input
+            className="px-3 py-2 border rounded-lg w-64"
+            value={page.title}
+            onChange={(e) => setPage({ ...page, title: e.target.value })}
+            placeholder="Comic Title"
+          />
+          <div className="ml-auto flex items-center gap-2">
+            <button className="px-3 py-2 rounded-lg bg-slate-900 text-white" onClick={exportPNG}>Export PNG</button>
+            <button className="px-3 py-2 rounded-lg bg-white border" onClick={exportJSON}>Save JSON</button>
+            <button className="px-3 py-2 rounded-lg bg-white border" onClick={importJSON}>Load JSON</button>
+          </div>
+        </div>
+      </header>
+
+      <main className="max-w-6xl mx-auto grid grid-cols-12 gap-4 px-4 py-4">
+        {/* Left Toolbar */}
+        <section className="col-span-3 space-y-4">
+          <div className="bg-white border rounded-xl p-3 shadow-sm">
+            <h3 className="font-semibold mb-2">Page</h3>
+            <div className="flex items-center gap-2 mb-2">
+              {(["strip", "widescreen", "square"]).map((a) => (
+                <button
+                  key={a}
+                  onClick={() => setPage({ ...page, aspect: a })}
+                  className={`px-3 py-1 rounded border ${page.aspect === a ? "bg-slate-900 text-white" : "bg-white"}`}
+                >{a}</button>
+              ))}
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+              {(["1x1", "1x2", "2x1", "2x2", "3x1", "1x4"]).map((l) => (
+                <button
+                  key={l}
+                  onClick={() => changeLayout(l)}
+                  className={`px-2 py-1 rounded border text-sm ${page.layout === l ? "bg-slate-900 text-white" : "bg-white"}`}
+              >{l}</button>
+              ))}
+            </div>
+            <div className="mt-3 flex items-center gap-3">
+              <label className="text-sm">Gutter</label>
+              <input type="range" min={0} max={32} value={page.gutter}
+                     onChange={(e) => setPage({ ...page, gutter: Number(e.target.value) })} />
+              <span className="text-sm w-8 text-right">{page.gutter}</span>
+            </div>
+            <div className="mt-2 flex items-center gap-3">
+              <label className="text-sm">Border</label>
+              <input type="checkbox" checked={page.border} onChange={(e) => setPage({ ...page, border: e.target.checked })} />
+            </div>
+            <div className="mt-2 flex items-center gap-2">
+              <label className="text-sm">Page BG</label>
+              <input type="color" value={page.bgColor} onChange={(e) => setPage({ ...page, bgColor: e.target.value })} />
+            </div>
+          </div>
+
+          <div className="bg-white border rounded-xl p-3 shadow-sm">
+            <h3 className="font-semibold mb-2">Panel {activePanel + 1}</h3>
+            <div className="flex items-center gap-3">
+              <label className="text-sm">BG Color</label>
+              <input type="color" value={page.panels[activePanel]?.bgColor || "#ffffff"} onChange={(e) => setPanelBgColor(e.target.value)} />
+            </div>
+            <div className="mt-2 flex items-center gap-2">
+              <button className="px-3 py-2 rounded bg-white border" onClick={setPanelBgImage}>Set BG Image</button>
+              <button className="px-3 py-2 rounded bg-white border" onClick={clearPanelBgImage}>Clear</button>
+            </div>
+            <div className="mt-3 grid grid-cols-2 gap-2">
+              <button className="px-2 py-2 rounded bg-slate-900 text-white" onClick={() => addElement("speech")}>
+                + Speech
+              </button>
+              <button className="px-2 py-2 rounded bg-slate-900 text-white" onClick={() => addElement("caption")}>
+                + Caption
+              </button>
+              <button className="px-2 py-2 rounded bg-slate-900 text-white" onClick={() => addElement("sfx")}>
+                + SFX
+              </button>
+              <button className="px-2 py-2 rounded bg-slate-900 text-white" onClick={() => addElement("image")}>
+                + Image
+              </button>
+            </div>
+          </div>
+
+          <div className="bg-white border rounded-xl p-3 shadow-sm">
+            <h3 className="font-semibold mb-2">Element</h3>
+            {!activeEl && <div className="text-sm text-slate-500">Select an element in the panel.</div>}
+            {activeEl && (
+              <div className="space-y-2">
+                {activeEl.text !== undefined && (
+                  <div>
+                    <label className="text-sm">Text</label>
+                    <textarea
+                      className="w-full mt-1 p-2 border rounded"
+                      rows={3}
+                      value={activeEl.text}
+                      onChange={(e) => updateElement(activeEl.id, { text: e.target.value })}
+                    />
+                  </div>
+                )}
+                {activeEl.type !== "image" && (
+                  <div className="grid grid-cols-2 gap-2">
+                    <div>
+                      <label className="text-sm">Font Size</label>
+                      <input type="range" min={10} max={64} value={activeEl.fontSize || 16} onChange={(e) => updateElement(activeEl.id, { fontSize: Number(e.target.value) })} />
+                    </div>
+                    <div>
+                      <label className="text-sm">Text Color</label>
+                      <input type="color" value={activeEl.color || "#111827"} onChange={(e) => updateElement(activeEl.id, { color: e.target.value })} />
+                    </div>
+                    <div>
+                      <label className="text-sm">Fill</label>
+                      <input type="color" value={activeEl.fill || "#ffffff00"} onChange={(e) => updateElement(activeEl.id, { fill: e.target.value })} />
+                    </div>
+                    <div>
+                      <label className="text-sm">Stroke</label>
+                      <input type="color" value={activeEl.stroke || "#111827"} onChange={(e) => updateElement(activeEl.id, { stroke: e.target.value })} />
+                    </div>
+                    <div>
+                      <label className="text-sm">Corner</label>
+                      <input type="range" min={0} max={32} value={activeEl.radius || 0} onChange={(e) => updateElement(activeEl.id, { radius: Number(e.target.value) })} />
+                    </div>
+                    <div>
+                      <label className="text-sm">Padding</label>
+                      <input type="range" min={0} max={32} value={activeEl.padding || 0} onChange={(e) => updateElement(activeEl.id, { padding: Number(e.target.value) })} />
+                    </div>
+                  </div>
+                )}
+                <div className="grid grid-cols-3 gap-2">
+                  <div>
+                    <label className="text-sm">Rotate</label>
+                    <input type="range" min={-45} max={45} value={activeEl.rotation || 0} onChange={(e) => updateElement(activeEl.id, { rotation: Number(e.target.value) })} />
+                  </div>
+                  <div className="flex items-end">
+                    <button className="w-full px-2 py-1 rounded border" onClick={sendBackward}>Send Back</button>
+                  </div>
+                  <div className="flex items-end">
+                    <button className="w-full px-2 py-1 rounded border" onClick={bringForward}>Bring Front</button>
+                  </div>
+                </div>
+                <div className="pt-1">
+                  <button className="px-3 py-2 rounded bg-rose-50 text-rose-700 border border-rose-200 w-full" onClick={() => deleteElement(activeEl.id)}>Delete Element</button>
+                </div>
+              </div>
+            )}
+          </div>
+        </section>
+
+        {/* Canvas */}
+        <section className="col-span-9">
+          <div className="bg-white border rounded-xl p-3 shadow-sm">
+            <div className="flex items-center justify-between mb-2">
+              <div className="text-sm text-slate-600">Tip: Click a panel to edit it. Click elements to select. Drag to move; use the corner handle to resize. Arrow keys nudge.</div>
+              <div className="flex items-center gap-2">
+                {page.panels.map((_, i) => (
+                  <button key={i} className={`px-2 py-1 rounded border text-sm ${activePanel === i ? "bg-slate-900 text-white" : "bg-white"}`} onClick={() => selectPanel(i)}>
+                    Panel {i + 1}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div className="w-full grid place-items-center">
+              <div
+                ref={boardRef}
+                className="relative"
+                style={{ width: pageSize.w, height: pageSize.h, background: page.bgColor, padding: page.border ? 8 : 0, boxShadow: "0 4px 16px rgba(0,0,0,0.08)", borderRadius: 16 }}
+              >
+                <div
+                  className="grid w-full h-full"
+                  style={{
+                    gridTemplateColumns: `repeat(${gridSpec.cols}, 1fr)`,
+                    gridTemplateRows: `repeat(${gridSpec.rows}, 1fr)`,
+                    gap: page.gutter,
+                  }}
+                >
+                  {page.panels.map((panel, idx) => (
+                    <div
+                      key={panel.id}
+                      className={`relative overflow-hidden border ${page.border ? "border-slate-800" : "border-transparent"} rounded-lg`}
+                      style={{ background: panel.bgColor }}
+                      onMouseDown={() => selectPanel(idx)}
+                      ref={(el) => (panelRefs.current[idx] = el)}
+                    >
+                      {panel.bgImage && (
+                        <img src={panel.bgImage} alt="panel bg" className="absolute inset-0 w-full h-full object-cover" />
+                      )}
+
+                      {/* Elements layer */}
+                      <div className="absolute inset-0" style={{ pointerEvents: "auto" }}>
+                        {panel.elements
+                          .slice()
+                          .sort((a, b) => (a.z || 0) - (b.z || 0))
+                          .map((el) => (
+                            <ElementView
+                              key={el.id}
+                              el={el}
+                              selected={activePanel === idx && activeElementId === el.id}
+                              onSelect={(id) => { setActivePanel(idx); setActiveElementId(id); }}
+                              onChange={(id, patch) => {
+                                if (activePanel !== idx) setActivePanel(idx);
+                                const panels = [...page.panels];
+                                const p = { ...panels[idx] };
+                                p.elements = p.elements.map((e) => (e.id === id ? { ...e, ...patch } : e));
+                                panels[idx] = p;
+                                setPage({ ...page, panels });
+                              }}
+                              boundsRef={{ current: panelRefs.current[idx] }}
+                            />
+                          ))}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
+      </main>
+
+      <footer className="max-w-6xl mx-auto px-4 pb-8 text-center text-xs text-slate-500">
+        Built for fast web‑comic mockups. Export a PNG or save/load JSON for later edits.
+      </footer>
+    </div>
+  );
+}
+
+// --------- File helpers ---------
+async function pickImageAsDataURL() {
+  return new Promise((resolve) => {
+    const input = document.createElement("input");
+    input.type = "file";
+    input.accept = "image/*";
+    input.onchange = () => {
+      const file = input.files?.[0];
+      if (!file) return resolve(null);
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result);
+      reader.readAsDataURL(file);
+    };
+    input.click();
+  });
+}
+
+async function pickJSONText() {
+  return new Promise((resolve) => {
+    const input = document.createElement("input");
+    input.type = "file";
+    input.accept = "application/json";
+    input.onchange = () => {
+      const file = input.files?.[0];
+      if (!file) return resolve(null);
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result));
+      reader.readAsText(file);
+    };
+    input.click();
+  });
+}
+
+const root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(<App />);

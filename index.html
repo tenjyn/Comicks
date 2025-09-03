@@ -41,7 +41,7 @@ const DEFAULT_PAGE = {
   gutter: 12,
   border: true,
   bgColor: "#ffffff",
-  layout: "2x2", // presets: '1x1','1x2','2x1','2x2','3x1'
+  layout: "2x2", // presets: '1x1','1x2','2x1','2x2','3x1','1x4'
   panels: [],
 };
 
@@ -58,6 +58,8 @@ const makePanelsForLayout = (layout) => {
       return [base(), base(), base(), base()];
     case "3x1":
       return [base(), base(), base()];
+    case "1x4":
+      return [base(), base(), base(), base()];
     default:
       return [base(), base(), base(), base()];
   }
@@ -283,6 +285,8 @@ export default function App() {
         return { cols: 2, rows: 2 };
       case "3x1":
         return { cols: 1, rows: 3 };
+      case "1x4":
+        return { cols: 4, rows: 1 };
       default:
         return { cols: 2, rows: 2 };
     }
@@ -412,7 +416,18 @@ export default function App() {
     try {
       const obj = JSON.parse(text);
       if (!obj || !Array.isArray(obj.panels)) throw new Error("Invalid file");
-      setPage(obj);
+      const merged = {
+        ...DEFAULT_PAGE,
+        ...obj,
+        id: obj.id || uid(),
+        panels: obj.panels.map((p) => ({
+          id: p.id || uid(),
+          bgColor: p.bgColor ?? "#f8fafc",
+          bgImage: p.bgImage ?? null,
+          elements: Array.isArray(p.elements) ? p.elements : [],
+        })),
+      };
+      setPage(merged);
       setActivePanel(0);
       setActiveElementId(null);
     } catch (e) {
@@ -471,12 +486,12 @@ export default function App() {
               ))}
             </div>
             <div className="flex flex-wrap items-center gap-2">
-              {(["1x1", "1x2", "2x1", "2x2", "3x1"]).map((l) => (
+              {(["1x1", "1x2", "2x1", "2x2", "3x1", "1x4"]).map((l) => (
                 <button
                   key={l}
                   onClick={() => changeLayout(l)}
                   className={`px-2 py-1 rounded border text-sm ${page.layout === l ? "bg-slate-900 text-white" : "bg-white"}`}
-                >{l}</button>
+              >{l}</button>
               ))}
             </div>
             <div className="mt-3 flex items-center gap-3">

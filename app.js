@@ -1,716 +1,618 @@
-const { useMemo, useRef, useState } = React;
+const { useState, useRef, useMemo, useEffect } = React;
 const { toPng } = htmlToImage;
 
-/**
- * Simple Web‑Comic Builder
- * - Choose layout (1,2,3,4 panels)
- * - Set panel background color or upload an image per panel
- * - Add draggable/resizable elements: Speech, Caption, SFX text, or Image
- * - Edit properties (text, font size, colors, rotation, z‑order)
- * - Export full page as PNG, or save/load JSON
- *
- * Notes:
- * - Uses TailwindCSS for styling (no import needed)
- * - No external backend; everything is in-memory
- */
+// --- utils ---
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const uid = () => Math.random().toString(36).slice(2, 9);
 
-// --------- Utilities ---------
-const uid = () => Math.random().toString(36).slice(2) + Date.now().toString(36);
+// Panel layout presets
+const LAYOUTS = {
+  '1': { name: '1 Panel', grid: 'grid-cols-1', panels: 1 },
+  '2h': { name: '2 Panels (Horizontal)', grid: 'md:grid-cols-2', panels: 2 },
+  '2v': { name: '2 Panels (Vertical)', grid: 'grid-cols-1', panels: 2, vertical: true },
+  '4': { name: '4 Panels (2x2)', grid: 'md:grid-cols-2', panels: 4 },
+};
 
-const clamp = (v, min, max) => Math.min(max, Math.max(min, v));
+const DEFAULT_PAGE = () => ({
+  layout: '4',
+  panels: Array.from({ length: 4 }, () => ({
+    id: uid(),
+    bg: '#ffffff',
+    elements: [],
+  }))
+});
 
-function download(dataUrl, filename) {
-  const a = document.createElement("a");
-  a.href = dataUrl;
-  a.download = filename;
-  a.click();
-}
-
-function downloadJSON(obj, filename) {
-  const blob = new Blob([JSON.stringify(obj, null, 2)], { type: "application/json" });
-  const url = URL.createObjectURL(blob);
-  download(url, filename);
-  setTimeout(() => URL.revokeObjectURL(url), 1000);
-}
-
-// --------- Defaults ---------
-const DEFAULT_PAGE = {
+const defaultText = (subtype) => ({
   id: uid(),
-  title: "Untitled Comic",
-  aspect: "strip", // 'square' | 'widescreen' | 'strip'
-  gutter: 12,
-  border: true,
-  bgColor: "#ffffff",
-  layout: "2x2", // presets: '1x1','1x2','2x1','2x2','3x1','1x4'
-  panels: [],
-};
+  type: 'text',
+  subtype, // 'speech' | 'caption' | 'sfx'
+  text: subtype === 'sfx' ? 'BAM!' : (subtype === 'caption' ? 'Caption...' : 'Speech...'),
+  x: 24, y: 24, w: 200, h: 80,
+  fontSize: subtype === 'sfx' ? 36 : 20,
+  color: subtype === 'caption' ? '#111827' : '#111827',
+  bg: subtype === 'caption' ? '#fef3c7' : '#ffffffcc',
+  rotate: 0,
+  z: 1,
+  align: 'left',
+  radius: subtype === 'speech' ? 16 : 8,
+  weight: subtype === 'sfx' ? 800 : 600,
+});
 
-const makePanelsForLayout = (layout) => {
-  const base = () => ({ id: uid(), bgColor: "#f8fafc", bgImage: null, elements: [] });
-  switch (layout) {
-    case "1x1":
-      return [base()];
-    case "1x2":
-      return [base(), base()];
-    case "2x1":
-      return [base(), base()];
-    case "2x2":
-      return [base(), base(), base(), base()];
-    case "3x1":
-      return [base(), base(), base()];
-    case "1x4":
-      return [base(), base(), base(), base()];
-    default:
-      return [base(), base(), base(), base()];
-  }
-};
+const defaultImage = (src, natural) => ({
+  id: uid(),
+  type: 'image',
+  src,
+  x: 24, y: 24,
+  w: Math.min(300, natural?.width || 300),
+  h: Math.min(220, natural?.height || 220),
+  z: 0,
+  rotate: 0,
+});
 
-const ELEMENT_PRESETS = {
-  speech: () => ({
-    id: uid(),
-    type: "speech",
-    x: 40,
-    y: 40,
-    w: 220,
-    h: 100,
-    rotation: 0,
-    text: "Your dialogue here…",
-    fontSize: 18,
-    color: "#111827",
-    fill: "#ffffff",
-    stroke: "#111827",
-    radius: 16,
-    padding: 10,
-    z: 1,
-  }),
-  caption: () => ({
-    id: uid(),
-    type: "caption",
-    x: 20,
-    y: 20,
-    w: 260,
-    h: 80,
-    rotation: 0,
-    text: "Caption text",
-    fontSize: 16,
-    color: "#111827",
-    fill: "#fff3cd",
-    stroke: "#111827",
-    radius: 8,
-    padding: 8,
-    z: 1,
-  }),
-  sfx: () => ({
-    id: uid(),
-    type: "sfx",
-    x: 60,
-    y: 60,
-    w: 220,
-    h: 80,
-    rotation: 0,
-    text: "KRAKOOM!",
-    fontSize: 36,
-    color: "#dc2626",
-    fill: "#ffffff00",
-    stroke: "#111827",
-    radius: 0,
-    padding: 0,
-    z: 2,
-  }),
-  image: (imgData) => ({
-    id: uid(),
-    type: "image",
-    x: 40,
-    y: 40,
-    w: 240,
-    h: 160,
-    rotation: 0,
-    imageData: imgData || null,
-    z: 0,
-  }),
-};
-
-// --------- Draggable/Resizable Element ---------
-function useDragResize({ onChange, boundsRef }) {
-  const dragging = useRef(null); // { kind: 'move'|'resize', id, startX, startY, startRect }
-
-  const onPointerDown = (e, id, kind, getRect) => {
-    e.stopPropagation();
-    const rect = getRect();
-    dragging.current = {
-      kind,
-      id,
-      startX: e.clientX,
-      startY: e.clientY,
-      startRect: rect,
-    };
-    (e.target).setPointerCapture?.(e.pointerId);
-  };
-
-  const onPointerMove = (e) => {
-    if (!dragging.current) return;
-    const dx = e.clientX - dragging.current.startX;
-    const dy = e.clientY - dragging.current.startY;
-    const { kind, id, startRect } = dragging.current;
-
-    const parent = boundsRef.current;
-    const bbox = parent?.getBoundingClientRect?.();
-    const maxW = bbox ? bbox.width : Infinity;
-    const maxH = bbox ? bbox.height : Infinity;
-
-    if (kind === "move") {
-      const nx = clamp(startRect.x + dx, 0, maxW - startRect.w);
-      const ny = clamp(startRect.y + dy, 0, maxH - startRect.h);
-      onChange(id, { x: nx, y: ny });
-    } else if (kind === "resize") {
-      const nw = clamp(startRect.w + dx, 40, maxW - startRect.x);
-      const nh = clamp(startRect.h + dy, 40, maxH - startRect.y);
-      onChange(id, { w: nw, h: nh });
-    }
-  };
-
-  const onPointerUp = (e) => {
-    if (dragging.current) {
-      (e.target).releasePointerCapture?.(e.pointerId);
-    }
-    dragging.current = null;
-  };
-
-  return { onPointerDown, onPointerMove, onPointerUp };
-}
-
-function ElementView({ el, selected, onSelect, onChange, boundsRef }) {
-  const wrapRef = useRef(null);
-  const { onPointerDown, onPointerMove, onPointerUp } = useDragResize({ onChange, boundsRef });
-
-  const baseStyle = {
-    transform: `translate(${el.x}px, ${el.y}px) rotate(${el.rotation}deg)`,
-    width: el.w,
-    height: el.h,
-    zIndex: el.z ?? 0,
-  };
-
-  const commonBox = (
-    <div
-      className={[
-        "absolute select-none",
-        selected ? "ring-2 ring-sky-500" : "ring-1 ring-slate-300",
-        "shadow-sm",
-        el.type !== "image" ? "bg-white" : "bg-transparent",
-      ].join(" ")}
-      style={baseStyle}
-      onPointerDown={(e) => { onSelect(el.id); onPointerDown(e, el.id, "move", () => ({ x: el.x, y: el.y, w: el.w, h: el.h })); }}
-      onPointerMove={onPointerMove}
-      onPointerUp={onPointerUp}
-      ref={wrapRef}
-    >
-      {/* Content */}
-      {el.type === "image" ? (
-        el.imageData ? (
-          <img src={el.imageData} alt="sticker" className="w-full h-full object-contain" draggable={false} />
-        ) : (
-          <div className="w-full h-full grid place-items-center bg-white/40 border border-dashed border-slate-400 text-slate-500 text-sm">
-            No image
-          </div>
-        )
-      ) : el.type === "sfx" ? (
-        <div className="w-full h-full grid place-items-center">
-          <div
-            className="font-extrabold uppercase tracking-wide text-center drop-shadow"
-            style={{
-              fontSize: el.fontSize,
-              color: el.color,
-              WebkitTextStroke: "1.5px #111827",
-            }}
-          >
-            {el.text}
-          </div>
-        </div>
-      ) : (
-        <div
-          className="w-full h-full"
-          style={{
-            background: el.fill,
-            color: el.color,
-            borderRadius: el.radius,
-            border: `2px solid ${el.stroke}`,
-            padding: el.padding,
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            textAlign: "center",
-            fontSize: el.fontSize,
-          }}
-        >
-          {el.text}
-        </div>
-      )}
-
-      {/* Resize handle */}
-      <div
-        className="absolute bottom-0 right-0 translate-x-1/2 translate-y-1/2 w-4 h-4 rounded-full bg-sky-500 border border-white shadow cursor-se-resize"
-        onPointerDown={(e) => onPointerDown(e, el.id, "resize", () => ({ x: el.x, y: el.y, w: el.w, h: el.h }))}
-        onPointerMove={onPointerMove}
-        onPointerUp={onPointerUp}
-      />
-    </div>
-  );
-
-  return commonBox;
-}
-
-// --------- Main App ---------
+// --- App ---
 function App() {
-  const [page, setPage] = useState(() => {
-    const initial = { ...DEFAULT_PAGE };
-    initial.panels = makePanelsForLayout(initial.layout);
-    return initial;
-  });
-
-  const [activePanel, setActivePanel] = useState(0);
-  const [activeElementId, setActiveElementId] = useState(null);
+  const [page, setPage] = useState(DEFAULT_PAGE);
+  const [selection, setSelection] = useState({ panelIdx: 0, elId: null });
   const boardRef = useRef(null);
-  const panelRefs = useRef([]);
 
-  const gridSpec = useMemo(() => {
-    const { layout } = page;
-    switch (layout) {
-      case "1x1":
-        return { cols: 1, rows: 1 };
-      case "1x2":
-        return { cols: 2, rows: 1 };
-      case "2x1":
-        return { cols: 1, rows: 2 };
-      case "2x2":
-        return { cols: 2, rows: 2 };
-      case "3x1":
-        return { cols: 1, rows: 3 };
-      case "1x4":
-        return { cols: 4, rows: 1 };
-      default:
-        return { cols: 2, rows: 2 };
-    }
+  // Keep panels array length in sync with layout preset
+  useEffect(() => {
+    const need = LAYOUTS[page.layout].panels;
+    setPage(p => {
+      let panels = p.panels.slice(0, need);
+      while (panels.length < need) panels.push({ id: uid(), bg: '#ffffff', elements: [] });
+      return { ...p, panels };
+    });
   }, [page.layout]);
 
-  const pageSize = useMemo(() => {
-    // Logical pixel size for the board preview
-    switch (page.aspect) {
-      case "square":
-        return { w: 900, h: 900 };
-      case "widescreen":
-        return { w: 1200, h: 675 };
-      case "strip":
-      default:
-        return { w: 1200, h: 450 };
-    }
-  }, [page.aspect]);
-
-  const selectPanel = (idx) => {
-    setActivePanel(idx);
-    setActiveElementId(null);
+  const setPanel = (idx, patch) => {
+    setPage(p => {
+      const panels = p.panels.map((pan, i) => i === idx ? { ...pan, ...patch } : pan);
+      return { ...p, panels };
+    });
   };
 
-  const addElement = async (kind) => {
-    const panels = [...page.panels];
-    const p = { ...panels[activePanel] };
-
-    if (kind === "image") {
-      const dataUrl = await pickImageAsDataURL();
-      if (!dataUrl) return;
-      p.elements = [...p.elements, ELEMENT_PRESETS.image(dataUrl)];
-    } else {
-      p.elements = [...p.elements, ELEMENT_PRESETS[kind]()] ;
-    }
-
-    panels[activePanel] = p;
-    setPage({ ...page, panels });
+  const mutateElement = (panelIdx, elId, patch) => {
+    setPage(p => {
+      const panels = p.panels.map((pan, i) => {
+        if (i !== panelIdx) return pan;
+        const elements = pan.elements.map(el => el.id === elId ? { ...el, ...patch } : el);
+        return { ...pan, elements };
+      });
+      return { ...p, panels };
+    });
   };
 
-  const updateElement = (id, patch) => {
-    const panels = [...page.panels];
-    const p = { ...panels[activePanel] };
-    p.elements = p.elements.map((e) => (e.id === id ? { ...e, ...patch } : e));
-    panels[activePanel] = p;
-    setPage({ ...page, panels });
+  const addText = (panelIdx, subtype) => {
+    setPanel(panelIdx, { elements: [...page.panels[panelIdx].elements, defaultText(subtype)] });
   };
 
-  const deleteElement = (id) => {
-    const panels = [...page.panels];
-    const p = { ...panels[activePanel] };
-    p.elements = p.elements.filter((e) => e.id !== id);
-    panels[activePanel] = p;
-    setPage({ ...page, panels });
-    setActiveElementId(null);
+  const addImage = async (panelIdx, file) => {
+    if (!file) return;
+    const url = URL.createObjectURL(file);
+    // Try to probe natural size
+    const probe = await new Promise(res => {
+      const img = new Image();
+      img.onload = () => res({ width: img.naturalWidth, height: img.naturalHeight });
+      img.onerror = () => res(null);
+      img.src = url;
+    });
+    setPanel(panelIdx, { elements: [...page.panels[panelIdx].elements, defaultImage(url, probe)] });
   };
 
-  const nudgeElement = (dx, dy) => {
-    if (!activeElementId) return;
-    const p = page.panels[activePanel];
-    const el = p.elements.find((e) => e.id === activeElementId);
-    if (!el) return;
-    updateElement(activeElementId, { x: clamp(el.x + dx, 0, Infinity), y: clamp(el.y + dy, 0, Infinity) });
+  const removeElement = (panelIdx, elId) => {
+    setPage(p => {
+      const panels = p.panels.map((pan, i) => {
+        if (i !== panelIdx) return pan;
+        return { ...pan, elements: pan.elements.filter(el => el.id !== elId) };
+      });
+      return { ...p, panels };
+    });
+    setSelection(s => ({ ...s, elId: null }));
   };
 
-  const changeLayout = (layout) => {
-    const prevPanels = page.panels;
-    const newPanels = makePanelsForLayout(layout);
-    // Try to preserve first few panels' content
-    for (let i = 0; i < Math.min(prevPanels.length, newPanels.length); i++) {
-      newPanels[i] = { ...newPanels[i], ...prevPanels[i] };
-    }
-    setPage({ ...page, layout, panels: newPanels });
-    setActivePanel(0);
-    setActiveElementId(null);
-  };
-
-  const setPanelBgColor = (color) => {
-    const panels = [...page.panels];
-    panels[activePanel] = { ...panels[activePanel], bgColor: color };
-    setPage({ ...page, panels });
-  };
-
-  const setPanelBgImage = async () => {
-    const dataUrl = await pickImageAsDataURL();
-    if (!dataUrl) return;
-    const panels = [...page.panels];
-    panels[activePanel] = { ...panels[activePanel], bgImage: dataUrl };
-    setPage({ ...page, panels });
-  };
-
-  const clearPanelBgImage = () => {
-    const panels = [...page.panels];
-    panels[activePanel] = { ...panels[activePanel], bgImage: null };
-    setPage({ ...page, panels });
-  };
-
-  const bringForward = () => {
-    if (!activeElementId) return;
-    const panels = [...page.panels];
-    const p = { ...panels[activePanel] };
-    const maxZ = Math.max(0, ...p.elements.map((e) => e.z || 0));
-    p.elements = p.elements.map((e) => (e.id === activeElementId ? { ...e, z: (e.z || 0) + 1 } : e));
-    panels[activePanel] = p;
-    setPage({ ...page, panels });
-  };
-
-  const sendBackward = () => {
-    if (!activeElementId) return;
-    const panels = [...page.panels];
-    const p = { ...panels[activePanel] };
-    p.elements = p.elements.map((e) => (e.id === activeElementId ? { ...e, z: Math.max(0, (e.z || 0) - 1) } : e));
-    panels[activePanel] = p;
-    setPage({ ...page, panels });
-  };
-
+  // Export PNG and bump dashboard count
   const exportPNG = async () => {
     if (!boardRef.current) return;
-    const dataUrl = await toPng(boardRef.current, { cacheBust: true, pixelRatio: 2 });
-    download(dataUrl, `${page.title.replace(/\s+/g, "_") || "comic"}.png`);
-  };
-
-  const exportJSON = () => downloadJSON(page, `${page.title.replace(/\s+/g, "_") || "comic"}.json`);
-
-  const importJSON = async () => {
-    const text = await pickJSONText();
-    if (!text) return;
     try {
-      const obj = JSON.parse(text);
-      if (!obj || !Array.isArray(obj.panels)) throw new Error("Invalid file");
-      const merged = {
-        ...DEFAULT_PAGE,
-        ...obj,
-        id: obj.id || uid(),
-        panels: obj.panels.map((p) => ({
-          id: p.id || uid(),
-          bgColor: p.bgColor ?? "#f8fafc",
-          bgImage: p.bgImage ?? null,
-          elements: Array.isArray(p.elements) ? p.elements : [],
-        })),
-      };
-      setPage(merged);
-      setActivePanel(0);
-      setActiveElementId(null);
+      const dataUrl = await toPng(boardRef.current, {
+        pixelRatio: 2,
+        cacheBust: true,
+        backgroundColor: '#ffffff'
+      });
+      const a = document.createElement('a');
+      a.href = dataUrl;
+      a.download = `comic-${Date.now()}.png`;
+      a.click();
+      const n = Number(localStorage.getItem('comicsCount') || '0') + 1;
+      localStorage.setItem('comicsCount', String(n));
+      alert('Exported PNG and updated dashboard count.');
     } catch (e) {
-      alert("Invalid JSON");
+      console.error(e);
+      alert('Export failed. (CORS or memory). Try smaller images.');
     }
   };
 
-  // Keyboard nudging for selected element
-  React.useEffect(() => {
-    const onKey = (e) => {
-      if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(e.key)) {
-        e.preventDefault();
-        const d = e.shiftKey ? 10 : 2;
-        if (e.key === "ArrowUp") nudgeElement(0, -d);
-        if (e.key === "ArrowDown") nudgeElement(0, d);
-        if (e.key === "ArrowLeft") nudgeElement(-d, 0);
-        if (e.key === "ArrowRight") nudgeElement(d, 0);
+  // Save / Load JSON
+  const saveJSON = () => {
+    const blob = new Blob([JSON.stringify(page)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = 'comic.json'; a.click();
+  };
+
+  const loadJSON = (file) => {
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const doc = JSON.parse(reader.result);
+        if (!doc || !Array.isArray(doc.panels)) throw new Error('Invalid format');
+        setPage({
+          layout: doc.layout in LAYOUTS ? doc.layout : '4',
+          panels: doc.panels.map(p => ({
+            id: p.id || uid(),
+            bg: p.bg || '#ffffff',
+            elements: Array.isArray(p.elements) ? p.elements.map(sanitizeElement) : []
+          }))
+        });
+      } catch (e) {
+        alert('Invalid JSON.');
       }
     };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [activeElementId, page, activePanel]);
+    reader.readAsText(file);
+  };
 
-  const activeEl = page.panels[activePanel]?.elements.find((e) => e.id === activeElementId) || null;
+  const sanitizeElement = (el) => {
+    if (el.type === 'image') {
+      return {
+        ...defaultImage(el.src || '', { width: el.w, height: el.h }),
+        x: clamp(el.x ?? 24, 0, 10_000),
+        y: clamp(el.y ?? 24, 0, 10_000),
+        w: clamp(el.w ?? 300, 10, 10_000),
+        h: clamp(el.h ?? 220, 10, 10_000),
+        z: el.z ?? 0,
+        rotate: el.rotate ?? 0
+      };
+    }
+    // text
+    const subtype = ['speech', 'caption', 'sfx'].includes(el.subtype) ? el.subtype : 'speech';
+    return {
+      ...defaultText(subtype),
+      text: String(el.text ?? '').slice(0, 2000),
+      x: clamp(el.x ?? 24, 0, 10_000),
+      y: clamp(el.y ?? 24, 0, 10_000),
+      w: clamp(el.w ?? 200, 40, 10_000),
+      h: clamp(el.h ?? 80, 30, 10_000),
+      fontSize: clamp(el.fontSize ?? 20, 8, 160),
+      color: el.color || '#111827',
+      bg: el.bg || (subtype === 'caption' ? '#fef3c7' : '#ffffffcc'),
+      rotate: el.rotate ?? 0,
+      z: el.z ?? 1,
+      align: ['left','center','right'].includes(el.align) ? el.align : 'left',
+      radius: clamp(el.radius ?? (subtype === 'speech' ? 16 : 8), 0, 64),
+      weight: clamp(el.weight ?? (subtype === 'sfx' ? 800 : 600), 100, 900),
+    };
+  };
 
+  // Keyboard: delete and nudge
+  useEffect(() => {
+    const onKey = (e) => {
+      if (!document.activeElement || document.activeElement.tagName === 'INPUT' || document.activeElement.tagName === 'TEXTAREA') return;
+      const { panelIdx, elId } = selection;
+      if (elId == null) return;
+      const step = e.shiftKey ? 10 : 1;
+      if (e.key === 'Delete' || e.key === 'Backspace') {
+        e.preventDefault();
+        removeElement(panelIdx, elId);
+      } else if (['ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].includes(e.key)) {
+        e.preventDefault();
+        const el = page.panels[panelIdx]?.elements.find(x => x.id === elId);
+        if (!el) return;
+        const dx = (e.key === 'ArrowRight') ? step : (e.key === 'ArrowLeft' ? -step : 0);
+        const dy = (e.key === 'ArrowDown') ? step : (e.key === 'ArrowUp' ? -step : 0);
+        mutateElement(panelIdx, elId, { x: el.x + dx, y: el.y + dy });
+      } else if (e.key === ']') {
+        e.preventDefault();
+        const el = page.panels[panelIdx]?.elements.find(x => x.id === elId);
+        if (el) mutateElement(panelIdx, elId, { z: (el.z ?? 0) + 1 });
+      } else if (e.key === '[') {
+        e.preventDefault();
+        const el = page.panels[panelIdx]?.elements.find(x => x.id === elId);
+        if (el) mutateElement(panelIdx, elId, { z: Math.max(0, (el.z ?? 0) - 1) });
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [selection, page]);
+
+  // Render
   return (
-    <div className="w-full min-h-screen bg-slate-50 text-slate-800">
-      <header className="sticky top-0 z-10 backdrop-blur bg-white/70 border-b border-slate-200">
-        <div className="max-w-6xl mx-auto px-4 py-3 flex items-center gap-3">
-          <input
-            className="px-3 py-2 border rounded-lg w-64"
-            value={page.title}
-            onChange={(e) => setPage({ ...page, title: e.target.value })}
-            placeholder="Comic Title"
-          />
-          <div className="ml-auto flex items-center gap-2">
-            <button className="px-3 py-2 rounded-lg bg-slate-900 text-white" onClick={exportPNG}>Export PNG</button>
-            <button className="px-3 py-2 rounded-lg bg-white border" onClick={exportJSON}>Save JSON</button>
-            <button className="px-3 py-2 rounded-lg bg-white border" onClick={importJSON}>Load JSON</button>
-          </div>
-        </div>
-      </header>
+    <div className="min-h-screen grid grid-rows-[auto,1fr]">
+      <Header
+        page={page}
+        onLayout={(layout) => setPage(p => ({ ...p, layout }))}
+        onExport={exportPNG}
+        onSave={saveJSON}
+        onLoad={loadJSON}
+      />
 
-      <main className="max-w-6xl mx-auto grid grid-cols-12 gap-4 px-4 py-4">
-        {/* Left Toolbar */}
-        <section className="col-span-3 space-y-4">
-          <div className="bg-white border rounded-xl p-3 shadow-sm">
-            <h3 className="font-semibold mb-2">Page</h3>
-            <div className="flex items-center gap-2 mb-2">
-              {(["strip", "widescreen", "square"]).map((a) => (
-                <button
-                  key={a}
-                  onClick={() => setPage({ ...page, aspect: a })}
-                  className={`px-3 py-1 rounded border ${page.aspect === a ? "bg-slate-900 text-white" : "bg-white"}`}
-                >{a}</button>
-              ))}
-            </div>
-            <div className="flex flex-wrap items-center gap-2">
-              {(["1x1", "1x2", "2x1", "2x2", "3x1", "1x4"]).map((l) => (
-                <button
-                  key={l}
-                  onClick={() => changeLayout(l)}
-                  className={`px-2 py-1 rounded border text-sm ${page.layout === l ? "bg-slate-900 text-white" : "bg-white"}`}
-              >{l}</button>
-              ))}
-            </div>
-            <div className="mt-3 flex items-center gap-3">
-              <label className="text-sm">Gutter</label>
-              <input type="range" min={0} max={32} value={page.gutter}
-                     onChange={(e) => setPage({ ...page, gutter: Number(e.target.value) })} />
-              <span className="text-sm w-8 text-right">{page.gutter}</span>
-            </div>
-            <div className="mt-2 flex items-center gap-3">
-              <label className="text-sm">Border</label>
-              <input type="checkbox" checked={page.border} onChange={(e) => setPage({ ...page, border: e.target.checked })} />
-            </div>
-            <div className="mt-2 flex items-center gap-2">
-              <label className="text-sm">Page BG</label>
-              <input type="color" value={page.bgColor} onChange={(e) => setPage({ ...page, bgColor: e.target.value })} />
-            </div>
-          </div>
-
-          <div className="bg-white border rounded-xl p-3 shadow-sm">
-            <h3 className="font-semibold mb-2">Panel {activePanel + 1}</h3>
-            <div className="flex items-center gap-3">
-              <label className="text-sm">BG Color</label>
-              <input type="color" value={page.panels[activePanel]?.bgColor || "#ffffff"} onChange={(e) => setPanelBgColor(e.target.value)} />
-            </div>
-            <div className="mt-2 flex items-center gap-2">
-              <button className="px-3 py-2 rounded bg-white border" onClick={setPanelBgImage}>Set BG Image</button>
-              <button className="px-3 py-2 rounded bg-white border" onClick={clearPanelBgImage}>Clear</button>
-            </div>
-            <div className="mt-3 grid grid-cols-2 gap-2">
-              <button className="px-2 py-2 rounded bg-slate-900 text-white" onClick={() => addElement("speech")}>
-                + Speech
-              </button>
-              <button className="px-2 py-2 rounded bg-slate-900 text-white" onClick={() => addElement("caption")}>
-                + Caption
-              </button>
-              <button className="px-2 py-2 rounded bg-slate-900 text-white" onClick={() => addElement("sfx")}>
-                + SFX
-              </button>
-              <button className="px-2 py-2 rounded bg-slate-900 text-white" onClick={() => addElement("image")}>
-                + Image
-              </button>
-            </div>
-          </div>
-
-          <div className="bg-white border rounded-xl p-3 shadow-sm">
-            <h3 className="font-semibold mb-2">Element</h3>
-            {!activeEl && <div className="text-sm text-slate-500">Select an element in the panel.</div>}
-            {activeEl && (
-              <div className="space-y-2">
-                {activeEl.text !== undefined && (
-                  <div>
-                    <label className="text-sm">Text</label>
-                    <textarea
-                      className="w-full mt-1 p-2 border rounded"
-                      rows={3}
-                      value={activeEl.text}
-                      onChange={(e) => updateElement(activeEl.id, { text: e.target.value })}
-                    />
-                  </div>
-                )}
-                {activeEl.type !== "image" && (
-                  <div className="grid grid-cols-2 gap-2">
-                    <div>
-                      <label className="text-sm">Font Size</label>
-                      <input type="range" min={10} max={64} value={activeEl.fontSize || 16} onChange={(e) => updateElement(activeEl.id, { fontSize: Number(e.target.value) })} />
-                    </div>
-                    <div>
-                      <label className="text-sm">Text Color</label>
-                      <input type="color" value={activeEl.color || "#111827"} onChange={(e) => updateElement(activeEl.id, { color: e.target.value })} />
-                    </div>
-                    <div>
-                      <label className="text-sm">Fill</label>
-                      <input type="color" value={activeEl.fill || "#ffffff00"} onChange={(e) => updateElement(activeEl.id, { fill: e.target.value })} />
-                    </div>
-                    <div>
-                      <label className="text-sm">Stroke</label>
-                      <input type="color" value={activeEl.stroke || "#111827"} onChange={(e) => updateElement(activeEl.id, { stroke: e.target.value })} />
-                    </div>
-                    <div>
-                      <label className="text-sm">Corner</label>
-                      <input type="range" min={0} max={32} value={activeEl.radius || 0} onChange={(e) => updateElement(activeEl.id, { radius: Number(e.target.value) })} />
-                    </div>
-                    <div>
-                      <label className="text-sm">Padding</label>
-                      <input type="range" min={0} max={32} value={activeEl.padding || 0} onChange={(e) => updateElement(activeEl.id, { padding: Number(e.target.value) })} />
-                    </div>
-                  </div>
-                )}
-                <div className="grid grid-cols-3 gap-2">
-                  <div>
-                    <label className="text-sm">Rotate</label>
-                    <input type="range" min={-45} max={45} value={activeEl.rotation || 0} onChange={(e) => updateElement(activeEl.id, { rotation: Number(e.target.value) })} />
-                  </div>
-                  <div className="flex items-end">
-                    <button className="w-full px-2 py-1 rounded border" onClick={sendBackward}>Send Back</button>
-                  </div>
-                  <div className="flex items-end">
-                    <button className="w-full px-2 py-1 rounded border" onClick={bringForward}>Bring Front</button>
-                  </div>
-                </div>
-                <div className="pt-1">
-                  <button className="px-3 py-2 rounded bg-rose-50 text-rose-700 border border-rose-200 w-full" onClick={() => deleteElement(activeEl.id)}>Delete Element</button>
-                </div>
-              </div>
-            )}
-          </div>
-        </section>
-
-        {/* Canvas */}
-        <section className="col-span-9">
-          <div className="bg-white border rounded-xl p-3 shadow-sm">
-            <div className="flex items-center justify-between mb-2">
-              <div className="text-sm text-slate-600">Tip: Click a panel to edit it. Click elements to select. Drag to move; use the corner handle to resize. Arrow keys nudge.</div>
-              <div className="flex items-center gap-2">
-                {page.panels.map((_, i) => (
-                  <button key={i} className={`px-2 py-1 rounded border text-sm ${activePanel === i ? "bg-slate-900 text-white" : "bg-white"}`} onClick={() => selectPanel(i)}>
-                    Panel {i + 1}
-                  </button>
-                ))}
-              </div>
-            </div>
-
-            <div className="w-full grid place-items-center">
-              <div
-                ref={boardRef}
-                className="relative"
-                style={{ width: pageSize.w, height: pageSize.h, background: page.bgColor, padding: page.border ? 8 : 0, boxShadow: "0 4px 16px rgba(0,0,0,0.08)", borderRadius: 16 }}
-              >
-                <div
-                  className="grid w-full h-full"
-                  style={{
-                    gridTemplateColumns: `repeat(${gridSpec.cols}, 1fr)`,
-                    gridTemplateRows: `repeat(${gridSpec.rows}, 1fr)`,
-                    gap: page.gutter,
-                  }}
-                >
-                  {page.panels.map((panel, idx) => (
-                    <div
-                      key={panel.id}
-                      className={`relative overflow-hidden border ${page.border ? "border-slate-800" : "border-transparent"} rounded-lg`}
-                      style={{ background: panel.bgColor }}
-                      onMouseDown={() => selectPanel(idx)}
-                      ref={(el) => (panelRefs.current[idx] = el)}
-                    >
-                      {panel.bgImage && (
-                        <img src={panel.bgImage} alt="panel bg" className="absolute inset-0 w-full h-full object-cover" />
-                      )}
-
-                      {/* Elements layer */}
-                      <div className="absolute inset-0" style={{ pointerEvents: "auto" }}>
-                        {panel.elements
-                          .slice()
-                          .sort((a, b) => (a.z || 0) - (b.z || 0))
-                          .map((el) => (
-                            <ElementView
-                              key={el.id}
-                              el={el}
-                              selected={activePanel === idx && activeElementId === el.id}
-                              onSelect={(id) => { setActivePanel(idx); setActiveElementId(id); }}
-                              onChange={(id, patch) => {
-                                if (activePanel !== idx) setActivePanel(idx);
-                                const panels = [...page.panels];
-                                const p = { ...panels[idx] };
-                                p.elements = p.elements.map((e) => (e.id === id ? { ...e, ...patch } : e));
-                                panels[idx] = p;
-                                setPage({ ...page, panels });
-                              }}
-                              boundsRef={{ current: panelRefs.current[idx] }}
-                            />
-                          ))}
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            </div>
-          </div>
-        </section>
-      </main>
-
-      <footer className="max-w-6xl mx-auto px-4 pb-8 text-center text-xs text-slate-500">
-        Built for fast web‑comic mockups. Export a PNG or save/load JSON for later edits.
-      </footer>
+      <div className="grid md:grid-cols-[1fr,320px] gap-3 p-3">
+        <Board
+          ref={boardRef}
+          page={page}
+          selection={selection}
+          setSelection={setSelection}
+          setPanel={setPanel}
+          mutateElement={mutateElement}
+          addText={addText}
+          addImage={addImage}
+        />
+        <Inspector
+          page={page}
+          selection={selection}
+          mutateElement={mutateElement}
+          removeElement={removeElement}
+          setPanel={setPanel}
+        />
+      </div>
     </div>
   );
 }
 
-// --------- File helpers ---------
-async function pickImageAsDataURL() {
-  return new Promise((resolve) => {
-    const input = document.createElement("input");
-    input.type = "file";
-    input.accept = "image/*";
-    input.onchange = () => {
-      const file = input.files?.[0];
-      if (!file) return resolve(null);
-      const reader = new FileReader();
-      reader.onload = () => resolve(reader.result);
-      reader.readAsDataURL(file);
-    };
-    input.click();
-  });
+// --- Header ---
+function Header({ page, onLayout, onExport, onSave, onLoad }) {
+  const fileJSON = useRef(null);
+  return (
+    <header className="bg-white border-b">
+      <div className="mx-auto max-w-7xl px-3 py-3 flex flex-wrap items-center gap-2">
+        <a href="dashboard.html" className="text-slate-700 hover:underline font-semibold">Dashboard</a>
+        <div className="grow" />
+        <div className="flex items-center gap-2">
+          <select
+            className="border rounded px-2 py-1"
+            value={page.layout}
+            onChange={(e) => onLayout(e.target.value)}
+            title="Panel layout"
+          >
+            {Object.entries(LAYOUTS).map(([k, v]) => (
+              <option key={k} value={k}>{v.name}</option>
+            ))}
+          </select>
+
+          <button className="px-3 py-1 rounded bg-slate-800 text-white" onClick={onExport} aria-label="Export PNG">Export PNG</button>
+          <button className="px-3 py-1 rounded border" onClick={onSave} aria-label="Save JSON">Save</button>
+
+          <input
+            ref={fileJSON}
+            type="file"
+            accept="application/json"
+            className="hidden"
+            onChange={(e) => onLoad(e.target.files?.[0] || null)}
+          />
+          <button className="px-3 py-1 rounded border" onClick={() => fileJSON.current?.click()} aria-label="Load JSON">Load</button>
+        </div>
+      </div>
+    </header>
+  );
 }
 
-async function pickJSONText() {
-  return new Promise((resolve) => {
-    const input = document.createElement("input");
-    input.type = "file";
-    input.accept = "application/json";
-    input.onchange = () => {
-      const file = input.files?.[0];
-      if (!file) return resolve(null);
-      const reader = new FileReader();
-      reader.onload = () => resolve(String(reader.result));
-      reader.readAsText(file);
+// --- Board / Panels ---
+const Board = React.forwardRef(function Board(
+  { page, selection, setSelection, setPanel, mutateElement, addText, addImage },
+  ref
+) {
+  const layout = LAYOUTS[page.layout];
+  const gridClasses = [
+    'grid gap-3 bg-slate-200 p-3 rounded',
+    layout.grid || 'grid-cols-1',
+    layout.vertical ? 'grid-rows-2' : '',
+    page.layout === '4' ? 'grid-cols-1 md:grid-cols-2' : ''
+  ].join(' ');
+
+  return (
+    <main className="min-h-[70vh]">
+      <div ref={ref} id="board" className={gridClasses}>
+        {page.panels.map((panel, i) => (
+          <Panel
+            key={panel.id}
+            idx={i}
+            panel={panel}
+            selectedElId={selection.panelIdx === i ? selection.elId : null}
+            onSelect={(elId) => setSelection({ panelIdx: i, elId })}
+            setPanel={setPanel}
+            mutateElement={mutateElement}
+            addText={addText}
+            addImage={addImage}
+          />
+        ))}
+      </div>
+    </main>
+  );
+});
+
+function Panel({ idx, panel, selectedElId, onSelect, setPanel, mutateElement, addText, addImage }) {
+  const hostRef = useRef(null);
+  const fileRef = useRef(null);
+
+  // Drag & simple resize (corner handle). Transient state in refs; commit on move.
+  const dragRef = useRef(null); // { id, kind: 'move'|'resize', startX, startY, startRect }
+
+  useEffect(() => {
+    const move = (e) => {
+      if (!dragRef.current) return;
+      e.preventDefault();
+      const { id, kind, startX, startY, startRect } = dragRef.current;
+      const dx = e.clientX - startX;
+      const dy = e.clientY - startY;
+      if (kind === 'move') {
+        mutateElement(idx, id, { x: startRect.x + dx, y: startRect.y + dy });
+      } else { // resize
+        mutateElement(idx, id, { w: Math.max(20, startRect.w + dx), h: Math.max(20, startRect.h + dy) });
+      }
     };
-    input.click();
-  });
+    const up = () => (dragRef.current = null);
+    window.addEventListener('pointermove', move);
+    window.addEventListener('pointerup', up);
+    return () => {
+      window.removeEventListener('pointermove', move);
+      window.removeEventListener('pointerup', up);
+    };
+  }, [idx, mutateElement]);
+
+  const startDrag = (e, el, kind) => {
+    e.stopPropagation();
+    onSelect(el.id);
+    dragRef.current = {
+      id: el.id,
+      kind,
+      startX: e.clientX,
+      startY: e.clientY,
+      startRect: { x: el.x, y: el.y, w: el.w, h: el.h }
+    };
+  };
+
+  return (
+    <section className="bg-white rounded shadow relative">
+      <div className="absolute right-2 top-2 z-[100] flex gap-1">
+        <button
+          className="text-xs px-2 py-1 rounded bg-slate-900 text-white"
+          onClick={() => addText(idx, 'speech')}
+        >+ Speech</button>
+        <button className="text-xs px-2 py-1 rounded bg-yellow-200" onClick={() => addText(idx, 'caption')}>+ Caption</button>
+        <button className="text-xs px-2 py-1 rounded bg-pink-200" onClick={() => addText(idx, 'sfx')}>+ SFX</button>
+        <input
+          ref={fileRef}
+          type="file"
+          className="hidden"
+          accept="image/*"
+          onChange={(e) => addImage(idx, e.target.files?.[0] || null)}
+        />
+        <button className="text-xs px-2 py-1 rounded border" onClick={() => fileRef.current?.click()}>+ Image</button>
+      </div>
+
+      <div
+        ref={hostRef}
+        className="relative min-h-[360px] aspect-[4/3] overflow-hidden rounded"
+        style={{ background: panel.bg }}
+        onPointerDown={() => onSelect(null)}
+      >
+        {panel.elements.map((el) => (
+          <ElementView
+            key={el.id}
+            el={el}
+            selected={selectedElId === el.id}
+            onPointerDown={(e) => startDrag(e, el, 'move')}
+            onResizeStart={(e) => startDrag(e, el, 'resize')}
+          />
+        ))}
+      </div>
+    </section>
+  );
 }
 
-const root = ReactDOM.createRoot(document.getElementById("root"));
+function ElementView({ el, selected, onPointerDown, onResizeStart }) {
+  const common = {
+    position: 'absolute',
+    left: el.x,
+    top: el.y,
+    width: el.w,
+    height: el.h,
+    transform: `rotate(${el.rotate || 0}deg)`,
+    zIndex: el.z || 0,
+  };
+
+  if (el.type === 'image') {
+    return (
+      <div
+        style={common}
+        className={`group ${selected ? 'ring-2 ring-sky-500' : 'ring-1 ring-slate-300'} rounded cursor-move`}
+        onPointerDown={onPointerDown}
+      >
+        <img src={el.src} alt="" className="w-full h-full object-cover rounded" />
+        {selected && <div className="handle" onPointerDown={onResizeStart} />}
+      </div>
+    );
+  }
+
+  // text
+  const align = el.align || 'left';
+  const weight = el.weight || 600;
+  return (
+    <div
+      style={common}
+      className={`group ${selected ? 'ring-2 ring-sky-500' : 'ring-1 ring-slate-300'} rounded cursor-move p-2`}
+      onPointerDown={onPointerDown}
+    >
+      <div
+        className="w-full h-full flex items-center justify-start"
+        style={{
+          background: el.bg || '#ffffffcc',
+          color: el.color || '#111827',
+          borderRadius: (el.radius ?? 12) + 'px',
+          fontSize: (el.fontSize || 18) + 'px',
+          fontWeight: weight,
+          textAlign: align
+        }}
+      >
+        <div className="w-full">{el.text}</div>
+      </div>
+      {selected && <div className="handle" onPointerDown={onResizeStart} />}
+    </div>
+  );
+}
+
+// --- Inspector ---
+function Inspector({ page, selection, mutateElement, removeElement, setPanel }) {
+  const { panelIdx, elId } = selection;
+  const panel = page.panels[panelIdx];
+  const el = panel?.elements.find(e => e.id === elId);
+
+  // panel background
+  const panelBg = panel?.bg || '#ffffff';
+
+  return (
+    <aside className="bg-white rounded shadow p-3 h-min">
+      <h2 className="font-semibold mb-2">Inspector</h2>
+
+      <div className="mb-4">
+        <label className="text-sm block mb-1">Panel background</label>
+        <input
+          type="color"
+          value={panelBg}
+          onChange={(e) => setPanel(panelIdx, { bg: e.target.value })}
+        />
+      </div>
+
+      {!el && <p className="text-sm text-slate-600">Select an element to edit its properties.</p>}
+
+      {el && (
+        <div className="space-y-3">
+          <div className="flex items-center justify-between">
+            <span className="text-sm font-medium capitalize">{el.type}{el.subtype ? ` · ${el.subtype}` : ''}</span>
+            <button className="text-red-600 text-sm underline" onClick={() => removeElement(panelIdx, el.id)}>Delete</button>
+          </div>
+
+          {el.type === 'text' && (
+            <>
+              <div>
+                <label className="text-sm block mb-1">Text</label>
+                <textarea
+                  className="w-full border rounded p-2 text-sm"
+                  rows={3}
+                  value={el.text}
+                  onChange={(e) => mutateElement(panelIdx, el.id, { text: e.target.value })}
+                />
+              </div>
+              <div className="grid grid-cols-2 gap-2">
+                <div>
+                  <label className="text-sm block mb-1">Font size</label>
+                  <input
+                    type="number" className="w-full border rounded p-1"
+                    value={el.fontSize}
+                    onChange={(e) => mutateElement(panelIdx, el.id, { fontSize: Number(e.target.value || 0) })}
+                  />
+                </div>
+                <div>
+                  <label className="text-sm block mb-1">Weight</label>
+                  <input
+                    type="number" className="w-full border rounded p-1"
+                    min="100" max="900" step="100"
+                    value={el.weight ?? 600}
+                    onChange={(e) => mutateElement(panelIdx, el.id, { weight: Number(e.target.value || 600) })}
+                  />
+                </div>
+                <div>
+                  <label className="text-sm block mb-1">Text color</label>
+                  <input
+                    type="color"
+                    value={el.color || '#111827'}
+                    onChange={(e) => mutateElement(panelIdx, el.id, { color: e.target.value })}
+                  />
+                </div>
+                <div>
+                  <label className="text-sm block mb-1">Background</label>
+                  <input
+                    type="color"
+                    value={el.bg || '#ffffffcc'}
+                    onChange={(e) => mutateElement(panelIdx, el.id, { bg: e.target.value })}
+                  />
+                </div>
+                <div>
+                  <label className="text-sm block mb-1">Radius</label>
+                  <input
+                    type="number" className="w-full border rounded p-1"
+                    value={el.radius ?? 12}
+                    onChange={(e) => mutateElement(panelIdx, el.id, { radius: Number(e.target.value || 0) })}
+                  />
+                </div>
+                <div>
+                  <label className="text-sm block mb-1">Align</label>
+                  <select
+                    className="w-full border rounded p-1"
+                    value={el.align || 'left'}
+                    onChange={(e) => mutateElement(panelIdx, el.id, { align: e.target.value })}
+                  >
+                    <option>left</option>
+                    <option>center</option>
+                    <option>right</option>
+                  </select>
+                </div>
+              </div>
+            </>
+          )}
+
+          {/* common numeric controls */}
+          <div className="grid grid-cols-2 gap-2">
+            <div>
+              <label className="text-sm block mb-1">X</label>
+              <input type="number" className="w-full border rounded p-1"
+                value={el.x}
+                onChange={(e) => mutateElement(panelIdx, el.id, { x: Number(e.target.value || 0) })}
+              />
+            </div>
+            <div>
+              <label className="text-sm block mb-1">Y</label>
+              <input type="number" className="w-full border rounded p-1"
+                value={el.y}
+                onChange={(e) => mutateElement(panelIdx, el.id, { y: Number(e.target.value || 0) })}
+              />
+            </div>
+            <div>
+              <label className="text-sm block mb-1">W</label>
+              <input type="number" className="w-full border rounded p-1"
+                value={el.w}
+                onChange={(e) => mutateElement(panelIdx, el.id, { w: Number(e.target.value || 0) })}
+              />
+            </div>
+            <div>
+              <label className="text-sm block mb-1">H</label>
+              <input type="number" className="w-full border rounded p-1"
+                value={el.h}
+                onChange={(e) => mutateElement(panelIdx, el.id, { h: Number(e.target.value || 0) })}
+              />
+            </div>
+            <div>
+              <label className="text-sm block mb-1">Rotate</label>
+              <input type="number" className="w-full border rounded p-1"
+                value={el.rotate || 0}
+                onChange={(e) => mutateElement(panelIdx, el.id, { rotate: Number(e.target.value || 0) })}
+              />
+            </div>
+            <div>
+              <label className="text-sm block mb-1">Z-index</label>
+              <input type="number" className="w-full border rounded p-1"
+                value={el.z || 0}
+                onChange={(e) => mutateElement(panelIdx, el.id, { z: Number(e.target.value || 0) })}
+              />
+            </div>
+          </div>
+        </div>
+      )}
+    </aside>
+  );
+}
+
+// --- boot ---
+const root = ReactDOM.createRoot(document.getElementById('root'));
 root.render(<App />);

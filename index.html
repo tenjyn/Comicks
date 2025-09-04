@@ -3,15 +3,19 @@
 <head>
   <meta charset="UTF-8" />
   <title>Comicks Builder</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="description" content="Simple web-comic builder: panels, draggable text & images, export to PNG." />
   <link rel="stylesheet" href="styles.css" />
-  <script src="https://cdn.tailwindcss.com"></script>
-  <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
-  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
-  <script src="https://unpkg.com/html-to-image/dist/html-to-image.min.js"></script>
-  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <!-- Defer heavy scripts; keep Babel last -->
+  <script src="https://cdn.tailwindcss.com" defer></script>
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin defer></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin defer></script>
+  <script src="https://unpkg.com/html-to-image/dist/html-to-image.min.js" defer></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js" defer></script>
 </head>
 <body class="bg-slate-50">
   <div id="root"></div>
+  <!-- Keep this last so everything above is ready -->
   <script type="text/babel" data-presets="env,react" src="app.js"></script>
 </body>
 </html>

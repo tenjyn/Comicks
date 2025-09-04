@@ -1,4 +1,16 @@
-/* Additional styles for Comicks builder */
-body {
-  margin: 0;
+/* Base hardening for Comicks builder */
+html, body, #root { height: 100%; }
+body { margin: 0; background: #f8fafc; }
+
+/* Handles look clearer with a small outline */
+.handle {
+  position: absolute;
+  width: 10px;
+  height: 10px;
+  right: -5px;
+  bottom: -5px;
+  background: white;
+  border: 1px solid rgba(0,0,0,.3);
+  border-radius: 2px;
+  cursor: nwse-resize;
 }

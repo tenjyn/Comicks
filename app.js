@@ -1,5 +1,6 @@
 const { useMemo, useRef, useState } = React;
-const { toPng } = htmlToImage;
+// htmlToImage may fail to load, so access it safely to avoid breaking the app
+const toPng = window.htmlToImage?.toPng;
 
 /**
  * Simple Web‑Comic Builder
@@ -403,7 +404,7 @@ function App() {
   };
 
   const exportPNG = async () => {
-    if (!boardRef.current) return;
+    if (!boardRef.current || !toPng) return;
     const dataUrl = await toPng(boardRef.current, { cacheBust: true, pixelRatio: 2 });
     download(dataUrl, `${page.title.replace(/\s+/g, "_") || "comic"}.png`);
   };
